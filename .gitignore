@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.runtime/
+node_modules/
+.export-*/
+*.local.json
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+/plugins/my-skills/skills/bggg-creator-image2ppt/projects/

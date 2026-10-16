@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "phg-skills",
+  "version": "1.1.0",
+  "description": "An opinionated agent skill stack for manuscripts targeted at Progress in Human Geography (PiHG), the leading review and theory journal in human geography, published by SAGE.",
+  "owner": {
+    "name": "Bryce Wang",
+    "email": "brycew6m@stanford.edu"
+  },
+  "metadata": {
+    "pluginRoot": "./"
+  },
+  "plugins": [
+    {
+      "name": "phg-skills",
+      "version": "1.1.0",
+      "source": "./",
+      "description": "Twelve-skill bundle covering the Progress in Human Geography (PiHG) review-essay and progress-report lifecycle, from a review-worthy topic to the double-anonymous rebuttal.",
+      "author": {
+        "name": "Bryce Wang",
+        "email": "brycew6m@stanford.edu"
+      },
+      "license": "MIT",
+      "homepage": "https://github.com/brycewang-stanford/awesome-journal-skills",
+      "repository": "https://github.com/brycewang-stanford/awesome-journal-skills",
+      "keywords": [
+        "progress-in-human-geography",
+        "human-geography",
+        "review-essay",
+        "theory-building",
+        "critical-geography",
+        "conceptual-synthesis",
+        "sage"
+      ],
+      "category": "academic",
+      "skills": [
+        "./skills/phg-workflow",
+        "./skills/phg-topic-selection",
+        "./skills/phg-theory-building",
+        "./skills/phg-literature-positioning",
+        "./skills/phg-argument-synthesis",
+        "./skills/phg-critical-intervention",
+        "./skills/phg-contribution-framing",
+        "./skills/phg-tables-figures",
+        "./skills/phg-writing-style",
+        "./skills/phg-submission",
+        "./skills/phg-review-process",
+        "./skills/phg-rebuttal"
+      ]
+    }
+  ]
+}

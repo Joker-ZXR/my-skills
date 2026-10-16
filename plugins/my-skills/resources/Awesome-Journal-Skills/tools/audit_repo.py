@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""Repository-level consistency checks for Awesome Journal Skills.
+
+The checks are intentionally dependency-free so they can run in CI and on a
+fresh clone.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import struct
+import sys
+import urllib.parse
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# Tripwire counts: these guard against accidental bulk deletion or stray
+# additions. When you intentionally add/remove packs, update these three values
+# (and the README badges) in the same commit. Run `python3 tools/audit_repo.py
+# --counts` to print the live numbers to copy in.
+EXPECTED_SKILL_COUNT = 4166
+EXPECTED_PACK_COUNT = 300
+EXPECTED_ROOT_JOURNAL_ENTRIES = 201
+EXPECTED_VENUE_COUNT = 744
+# Executed empirical evidence cases under showcase/. Each is a real MCP tool
+# run committed as documentation; removing one silently would weaken the
+# repo's central "automated empirical research" claim.
+EXPECTED_SHOWCASE_CASES = 5
+
+IMPORTED_ROOTS = {
+    "AER-Skills",
+    "AER-skills",
+    "Nature-Skills",
+    "nature-skills",
+    "nature-paper-skills",
+    "claude-scholar",
+    "codex-claude-academic-skills",
+}
+
+README_FILES = [ROOT / "README.md", ROOT / "README.en.md"]
+CHINESE_DEPTH_PACKS_REQUIRING_SOURCE_MAPS = {
+    "Accounting-Research-Skills",
+    "China-Economic-Quarterly-Skills",
+    "China-Industrial-Economics-Skills",
+    "China-Rural-Economy-Skills",
+    "Chinese-Public-Administration-Skills",
+    "Economic-Research-Journal-Skills",
+    "Journal-of-Finance-and-Economics-Skills",
+    "Journal-of-Financial-Research-Skills",
+    "Journal-of-Management-Sciences-in-China-Skills",
+    "Journal-of-Management-World-Skills",
+    "Journal-of-Quantitative-and-Technological-Economics-Skills",
+    "Journal-of-World-Economy-Skills",
+    "Nankai-Business-Review-Skills",
+    "Social-Sciences-in-China-Skills",
+    "Sociological-Studies-Skills",
+}
+ROOT_ENTRY_MARKER = "AJS-ROOT-JOURNAL-ENTRY"
+# Repositories under the maintainer's account that actually exist. Every pack
+# lives inside this monorepo; 173 packs once advertised standalone repositories
+# (`/plugin marketplace add .../ci-skills`) that were never created, so a user
+# following the README hit "Repository not found" (issue #21). Any other
+# brycewang-stanford/<name> URL is presumed to be that mistake again. Add a name
+# here only after the repository is public.
+OWN_ACCOUNT = "brycewang-stanford"
+KNOWN_OWN_REPOS = {
+    "awesome-journal-skills",
+    "aer-skills",
+    "auto-empirical-research-skills",
+    "statspai",
+}
+OWN_REPO_RE = re.compile(
+    r"(?:github\.com/|marketplace add\s+)" + OWN_ACCOUNT + r"/([A-Za-z0-9._-]+?)(?:\.git)?(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+LINK_RE = re.compile(
+    r"(?<!!)\[[^\]]*]\(([^)]+)\)"
+    r"|<a\s+[^>]*href=[\"']([^\"']+)[\"']"
+    r"|<img\s+[^>]*src=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
+INLINE_CODE_RE = re.compile(r"`[^`]*`")
+FRONTMATTER_KEY_RE = re.compile(r"^([A-Za-z0-9_-]+):", re.MULTILINE)
+FRONTMATTER_NAME_RE = re.compile(r"^name:\s*[\"']?([^\"'\n]+)", re.MULTILINE)
+FRONTMATTER_DESCRIPTION_RE = re.compile(r"^description:\s*\S+", re.MULTILINE)
+ROOT_CANONICAL_RE = re.compile(r"^- Canonical skill:\s*\[[^\]]+]\(([^)]+)\)", re.MULTILINE)
+ROOT_SKILL_NAME_RE = re.compile(r"^- Skill name:\s*`([^`]+)`", re.MULTILINE)
+ROOT_BUNDLE_RE = re.compile(r"^- Bundle:\s*\[[^\]]+]\(([^)]+)\)", re.MULTILINE)
+
+
+def rel(path: Path) -> str:
+    return path.relative_to(ROOT).as_posix()
+
+
+def is_hidden_or_git(path: Path) -> bool:
+    return any(part == ".git" for part in path.parts)
+
+
+def is_nature_plugin_mirror(path: Path) -> bool:
+    parts = [part.casefold() for part in path.relative_to(ROOT).parts]
+    return len(parts) >= 4 and parts[:3] == ["nature-skills", "plugins", "nature-skills"]
+
+
+def is_imported_root(path: Path) -> bool:
+    return top_level(path) in IMPORTED_ROOTS
+
+
+def iter_skill_files() -> list[Path]:
+    return sorted(
+        path
+        for path in ROOT.rglob("SKILL.md")
+        if not is_hidden_or_git(path) and not is_nature_plugin_mirror(path)
+    )
+
+
+def top_level(path: Path) -> str:
+    return path.relative_to(ROOT).parts[0]
+
+
+def first_party_plugin_roots() -> list[Path]:
+    return sorted(
+        path.parent.parent
+        for path in ROOT.glob("*/.claude-plugin/plugin.json")
+        if path.parent.parent.is_dir() and top_level(path) not in IMPORTED_ROOTS
+    )
+
+
+def load_json(path: Path, errors: list[str]) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - report any parse/read issue.
+        errors.append(f"{rel(path)}: invalid JSON: {exc}")
+        return None
+
+
+def check_counts(errors: list[str]) -> None:
+    skill_count = len(iter_skill_files())
+    if skill_count != EXPECTED_SKILL_COUNT:
+        errors.append(f"expected {EXPECTED_SKILL_COUNT} canonical SKILL.md files, found {skill_count}")
+
+    pack_roots = set(first_party_plugin_roots())
+    if len(pack_roots) != EXPECTED_PACK_COUNT:
+        names = ", ".join(sorted(rel(path) for path in pack_roots))
+        errors.append(f"expected {EXPECTED_PACK_COUNT} curated pack roots, found {len(pack_roots)}: {names}")
+
+    root_entries = []
+    for path in ROOT.glob("*/README.md"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if ROOT_ENTRY_MARKER in text:
+            root_entries.append(path)
+            skills = list(path.parent.rglob("SKILL.md"))
+            if skills:
+                errors.append(f"{rel(path.parent)} is a root journal entry but contains SKILL.md")
+    if len(root_entries) != EXPECTED_ROOT_JOURNAL_ENTRIES:
+        errors.append(
+            f"expected {EXPECTED_ROOT_JOURNAL_ENTRIES} root journal entries, found {len(root_entries)}"
+        )
+
+
+def check_external_import_policy(errors: list[str]) -> None:
+    gitmodules = ROOT / ".gitmodules"
+    if gitmodules.exists():
+        errors.append(f"{rel(gitmodules)} must not exist; third-party packs are external links")
+
+    submodule_workflow = ROOT / ".github" / "workflows" / "sync-submodules.yml"
+    if submodule_workflow.exists():
+        errors.append(
+            f"{rel(submodule_workflow)} must not exist; this index no longer vendors submodules"
+        )
+
+    for name in sorted(IMPORTED_ROOTS):
+        path = ROOT / name
+        if path.exists():
+            errors.append(f"{name}/ must stay external-only, not vendored into this repository")
+
+
+def resolve_local_link(base: Path, target: str) -> Path:
+    target = target.split("#", 1)[0].split("?", 1)[0]
+    return (base / urllib.parse.unquote(target)).resolve()
+
+
+def check_root_journal_entries(errors: list[str]) -> None:
+    for readme in sorted(ROOT.glob("*/README.md")):
+        text = readme.read_text(encoding="utf-8", errors="replace")
+        if ROOT_ENTRY_MARKER not in text:
+            continue
+
+        entry_root = readme.parent
+        canonical_match = ROOT_CANONICAL_RE.search(text)
+        skill_name_match = ROOT_SKILL_NAME_RE.search(text)
+        bundle_match = ROOT_BUNDLE_RE.search(text)
+
+        if not canonical_match:
+            errors.append(f"{rel(readme)}: root journal entry missing canonical skill link")
+            continue
+        if not skill_name_match:
+            errors.append(f"{rel(readme)}: root journal entry missing skill name")
+            continue
+        if not bundle_match:
+            errors.append(f"{rel(readme)}: root journal entry missing bundle link")
+            continue
+
+        canonical = resolve_local_link(entry_root, canonical_match.group(1))
+        bundle = resolve_local_link(entry_root, bundle_match.group(1))
+        skill_name = skill_name_match.group(1).strip()
+
+        try:
+            canonical.relative_to(ROOT)
+            bundle.relative_to(ROOT)
+        except ValueError:
+            errors.append(f"{rel(readme)}: root journal entry links outside repository")
+            continue
+
+        skill_file = canonical / "SKILL.md"
+        if not skill_file.exists():
+            errors.append(f"{rel(readme)}: canonical skill target lacks SKILL.md")
+            continue
+        if canonical.name != skill_name:
+            errors.append(
+                f"{rel(readme)}: skill name {skill_name!r} != canonical folder {canonical.name!r}"
+            )
+        if not bundle.exists() or not bundle.is_dir():
+            errors.append(f"{rel(readme)}: bundle target does not exist")
+        else:
+            try:
+                canonical.relative_to(bundle / "skills")
+            except ValueError:
+                errors.append(
+                    f"{rel(readme)}: canonical skill is not under declared bundle's skills/"
+                )
+
+        frontmatter = skill_file.read_text(encoding="utf-8", errors="replace")
+        name_match = FRONTMATTER_NAME_RE.search(frontmatter)
+        if name_match and name_match.group(1).strip() != skill_name:
+            errors.append(
+                f"{rel(readme)}: skill name {skill_name!r} "
+                f"!= canonical frontmatter {name_match.group(1).strip()!r}"
+            )
+
+
+def check_readme_badges(errors: list[str]) -> None:
+    for path in README_FILES:
+        text = path.read_text(encoding="utf-8")
+        if str(EXPECTED_SKILL_COUNT) not in text:
+            errors.append(f"{rel(path)} does not mention expected skill count {EXPECTED_SKILL_COUNT}")
+        if str(EXPECTED_PACK_COUNT) not in text:
+            errors.append(f"{rel(path)} does not mention expected pack count {EXPECTED_PACK_COUNT}")
+        if str(EXPECTED_VENUE_COUNT) not in text:
+            errors.append(f"{rel(path)} does not mention expected venue count {EXPECTED_VENUE_COUNT}")
+
+    required_banner_tokens = {
+        "{{SKILL_COUNT}}", "{{PACK_COUNT}}", "{{JOURNAL_COUNT}}",
+        "{{CONFERENCE_COUNT}}", "{{VENUE_COUNT}}",
+    }
+    for path in (ROOT / "assets/banner-src/banner-zh.html", ROOT / "assets/banner-src/banner-en.html"):
+        text = path.read_text(encoding="utf-8")
+        missing = sorted(required_banner_tokens - set(re.findall(r"{{[A-Z_]+}}", text)))
+        if missing:
+            errors.append(f"{rel(path)} missing generated count token(s): {missing}")
+
+
+# The two READMEs differ only in prose language; the catalogue they present must be
+# the same one. These are the language-specific assets, exempt by construction.
+README_LOCALE_ASSETS = {"assets/banner-zh.png", "assets/banner-en.png"}
+PACK_LINK_RE = re.compile(r'href="([^"]+-Skills/[^"]*)"|\]\(([^)]*-Skills/[^)]*)\)')
+README_ASSET_RE = re.compile(r'src="(assets/[^"]+)"')
+
+
+def check_readme_parity(errors: list[str]) -> None:
+    """The English README must offer the same catalogue as the Chinese one.
+
+    `README.en.md` exists so that a reader without Chinese sees the same 1,017 pack
+    entries and the same cover wall, not a subset someone stopped updating. Nothing
+    made that true before this check: the two files are maintained by hand, 2,250
+    lines each, and a card added to one and not the other is invisible in review.
+    """
+    zh = (ROOT / "README.md").read_text(encoding="utf-8")
+    en = (ROOT / "README.en.md").read_text(encoding="utf-8")
+
+    def pack_links(text: str) -> set[str]:
+        return {a or b for a, b in PACK_LINK_RE.findall(text)}
+
+    def assets(text: str) -> set[str]:
+        return set(README_ASSET_RE.findall(text)) - README_LOCALE_ASSETS
+
+    for label, zh_set, en_set in (
+        ("pack link", pack_links(zh), pack_links(en)),
+        ("asset", assets(zh), assets(en)),
+    ):
+        for missing_in, extra in (("README.en.md", zh_set - en_set),
+                                  ("README.md", en_set - zh_set)):
+            if extra:
+                shown = ", ".join(sorted(extra)[:5])
+                more = f" (+{len(extra) - 5} more)" if len(extra) > 5 else ""
+                errors.append(
+                    f"{missing_in} is missing {len(extra)} {label}(s) the other README "
+                    f"has: {shown}{more}")
+
+
+def check_root_marketplace(errors: list[str]) -> None:
+    marketplace_path = ROOT / ".claude-plugin" / "marketplace.json"
+    marketplace = load_json(marketplace_path, errors)
+    if not marketplace:
+        return
+
+    entries = marketplace.get("plugins")
+    if not isinstance(entries, list):
+        errors.append(f"{rel(marketplace_path)} plugins must be a list")
+        return
+
+    root_version = marketplace.get("version")
+    entry_versions = {entry.get("version") for entry in entries if isinstance(entry, dict)}
+    if len(entry_versions) == 1 and root_version not in entry_versions:
+        errors.append(
+            f"{rel(marketplace_path)} top-level version {root_version!r} "
+            f"!= pack release version {next(iter(entry_versions))!r}"
+        )
+
+    expected_roots = {rel(path) for path in first_party_plugin_roots()}
+    seen_roots: set[str] = set()
+    seen_names: set[str] = set()
+
+    if len(entries) != len(expected_roots):
+        errors.append(
+            f"{rel(marketplace_path)} expected {len(expected_roots)} plugin entries, "
+            f"found {len(entries)}"
+        )
+
+    for index, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict):
+            errors.append(f"{rel(marketplace_path)} plugins[{index}] must be an object")
+            continue
+
+        name = str(entry.get("name") or "").strip()
+        source = str(entry.get("source") or "").strip()
+        if not name:
+            errors.append(f"{rel(marketplace_path)} plugins[{index}] missing name")
+        elif name in seen_names:
+            errors.append(f"{rel(marketplace_path)} duplicate plugin name {name!r}")
+        else:
+            seen_names.add(name)
+
+        if not source.startswith("./"):
+            errors.append(f"{rel(marketplace_path)} plugin {name or index!r} source must start with './'")
+            continue
+
+        source_root = source[2:].rstrip("/")
+        source_path = ROOT / source_root
+        if source_root in IMPORTED_ROOTS:
+            errors.append(f"{rel(marketplace_path)} plugin {name!r} points to external import {source_root!r}")
+            continue
+        if source_root in seen_roots:
+            errors.append(f"{rel(marketplace_path)} duplicate plugin source {source!r}")
+        else:
+            seen_roots.add(source_root)
+        if not source_path.is_dir():
+            errors.append(f"{rel(marketplace_path)} plugin {name!r} source {source!r} does not exist")
+            continue
+
+        plugin_path = source_path / ".claude-plugin" / "plugin.json"
+        plugin = load_json(plugin_path, errors)
+        if not plugin:
+            continue
+        if name and name != plugin.get("name"):
+            errors.append(
+                f"{rel(marketplace_path)} plugin {source!r} name {name!r} "
+                f"!= {rel(plugin_path)} {plugin.get('name')!r}"
+            )
+        version = entry.get("version")
+        if version != plugin.get("version"):
+            errors.append(
+                f"{rel(marketplace_path)} plugin {name!r} version {version!r} "
+                f"!= {rel(plugin_path)} {plugin.get('version')!r}"
+            )
+
+    missing = sorted(expected_roots - seen_roots)
+    extra = sorted(seen_roots - expected_roots)
+    if missing or extra:
+        errors.append(
+            f"{rel(marketplace_path)} source coverage drift: "
+            f"missing={missing or []}, extra={extra or []}"
+        )
+
+
+def check_plugin_metadata(errors: list[str]) -> None:
+    for plugin_path in sorted(ROOT.glob("*/.claude-plugin/plugin.json")):
+        pack_root = plugin_path.parent.parent
+        if top_level(plugin_path) in IMPORTED_ROOTS:
+            continue
+        plugin = load_json(plugin_path, errors)
+        marketplace_path = plugin_path.parent / "marketplace.json"
+        if not marketplace_path.exists():
+            errors.append(f"{rel(marketplace_path)} is missing")
+            continue
+        marketplace = load_json(marketplace_path, errors)
+        if not plugin or not marketplace:
+            continue
+
+        plugin_version = plugin.get("version")
+        if not plugin_version:
+            errors.append(f"{rel(plugin_path)} missing version")
+
+        if plugin.get("name") != marketplace.get("name"):
+            errors.append(
+                f"{rel(marketplace_path)} name {marketplace.get('name')!r} "
+                f"!= plugin.json {plugin.get('name')!r}"
+            )
+
+        market_version = marketplace.get("version")
+        if market_version is not None and market_version != plugin_version:
+            errors.append(
+                f"{rel(marketplace_path)} version {market_version!r} != plugin.json {plugin_version!r}"
+            )
+
+        entries = marketplace.get("plugins") or []
+        if len(entries) != 1:
+            errors.append(f"{rel(marketplace_path)} should contain exactly one plugin entry")
+            continue
+
+        entry = entries[0]
+        if entry.get("name") != plugin.get("name"):
+            errors.append(
+                f"{rel(marketplace_path)} plugin entry name {entry.get('name')!r} "
+                f"!= plugin.json {plugin.get('name')!r}"
+            )
+        if entry.get("version") != plugin_version:
+            errors.append(
+                f"{rel(marketplace_path)} plugin entry version {entry.get('version')!r} "
+                f"!= plugin.json {plugin_version!r}"
+            )
+        if entry.get("license") != plugin.get("license"):
+            errors.append(
+                f"{rel(marketplace_path)} plugin entry license {entry.get('license')!r} "
+                f"!= plugin.json {plugin.get('license')!r}"
+            )
+
+        # Claude Code's validator rejects a skill path without the leading "./".
+        actual = sorted(
+            f"./skills/{path.parent.name}"
+            for path in (pack_root / "skills").glob("*/SKILL.md")
+        )
+        declared = sorted(entry.get("skills") or [])
+        if actual and not declared:
+            errors.append(f"{rel(marketplace_path)} plugin entry has no declared skills")
+        elif declared and actual and actual != declared:
+            missing = sorted(set(actual) - set(declared))
+            extra = sorted(set(declared) - set(actual))
+            errors.append(
+                f"{rel(marketplace_path)} skills list drift: "
+                f"missing={missing or []}, extra={extra or []}"
+            )
+
+
+def check_pack_documentation(errors: list[str]) -> None:
+    for plugin_path in sorted(ROOT.glob("*/.claude-plugin/plugin.json")):
+        pack_root = plugin_path.parent.parent
+        if top_level(plugin_path) in IMPORTED_ROOTS:
+            continue
+
+        for name in ("README.md", "README.zh-CN.md", "LICENSE"):
+            if not (pack_root / name).exists():
+                errors.append(f"{rel(pack_root)} missing {name}")
+
+
+def check_source_maps(errors: list[str]) -> None:
+    for pack_name in sorted(CHINESE_DEPTH_PACKS_REQUIRING_SOURCE_MAPS):
+        source_map = ROOT / pack_name / "resources" / "official-source-map.md"
+        if not source_map.exists():
+            errors.append(f"{rel(source_map)} is missing")
+            continue
+
+        text = source_map.read_text(encoding="utf-8", errors="replace")
+        if len(text.strip()) < 400:
+            errors.append(f"{rel(source_map)} is too short to be a useful source map")
+        if not re.search(r"https?://", text):
+            errors.append(f"{rel(source_map)} has no source URL")
+        if not re.search(r"\b20\d{2}-\d{2}(?:-\d{2})?\b", text):
+            errors.append(f"{rel(source_map)} has no visible access/check date")
+
+
+def check_skill_frontmatter(errors: list[str]) -> None:
+    first_party_names: dict[str, list[Path]] = {}
+
+    for path in iter_skill_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if not text.startswith("---\n"):
+            errors.append(f"{rel(path)}: missing YAML frontmatter")
+            continue
+        end = text.find("\n---", 4)
+        if end == -1:
+            errors.append(f"{rel(path)}: unterminated YAML frontmatter")
+            continue
+        frontmatter = text[4:end]
+        name_match = FRONTMATTER_NAME_RE.search(frontmatter)
+        if not name_match:
+            errors.append(f"{rel(path)}: frontmatter missing name")
+        if not FRONTMATTER_DESCRIPTION_RE.search(frontmatter):
+            errors.append(f"{rel(path)}: frontmatter missing description")
+
+        if is_imported_root(path):
+            continue
+
+        keys = FRONTMATTER_KEY_RE.findall(frontmatter)
+        extra_keys = sorted(set(keys) - {"name", "description"})
+        if extra_keys:
+            errors.append(f"{rel(path)}: first-party frontmatter has extra keys {extra_keys}")
+
+        if name_match:
+            name = name_match.group(1).strip()
+            first_party_names.setdefault(name, []).append(path)
+            if name != path.parent.name:
+                errors.append(
+                    f"{rel(path)}: frontmatter name {name!r} != folder {path.parent.name!r}"
+                )
+
+    for name, paths in sorted(first_party_names.items()):
+        if len(paths) > 1:
+            locations = ", ".join(rel(path) for path in paths)
+            errors.append(f"duplicate first-party skill name {name!r}: {locations}")
+
+
+def check_showcase(errors: list[str]) -> None:
+    showcase = ROOT / "showcase"
+    index = showcase / "README.md"
+    if not index.exists():
+        errors.append("showcase/README.md is missing")
+        return
+    index_text = index.read_text(encoding="utf-8", errors="replace")
+    case_dirs = sorted(p for p in showcase.iterdir() if p.is_dir())
+    if len(case_dirs) != EXPECTED_SHOWCASE_CASES:
+        errors.append(
+            f"expected {EXPECTED_SHOWCASE_CASES} showcase case directories, "
+            f"found {len(case_dirs)}"
+        )
+    for case in case_dirs:
+        readme = case / "README.md"
+        if not readme.exists():
+            errors.append(f"{rel(case)} has no README.md")
+            continue
+        if f"{case.name}/README.md" not in index_text:
+            errors.append(f"showcase/README.md does not link {case.name}/README.md")
+        case_text = readme.read_text(encoding="utf-8", errors="replace")
+        if "运行日期" not in case_text:
+            errors.append(f"{rel(readme)} lacks the 运行日期 (run date) evidence marker")
+        if "运行备注" not in case_text:
+            errors.append(f"{rel(readme)} lacks the 运行备注 (honest run notes) section")
+
+
+def markdown_files_to_check() -> list[Path]:
+    return sorted(
+        path
+        for path in ROOT.rglob("*.md")
+        if not is_hidden_or_git(path) and not is_imported_root(path)
+    )
+
+
+def iter_markdown_link_lines(text: str) -> list[tuple[int, str]]:
+    lines: list[tuple[int, str]] = []
+    in_fence = False
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        lines.append((lineno, INLINE_CODE_RE.sub("", line)))
+
+    return lines
+
+
+def is_external_target(target: str) -> bool:
+    lowered = target.lower()
+    return lowered.startswith(("http://", "https://", "mailto:", "data:")) or target.startswith("#")
+
+
+def check_markdown_links(errors: list[str]) -> None:
+    for path in markdown_files_to_check():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for lineno, line in iter_markdown_link_lines(text):
+            for match in LINK_RE.finditer(line):
+                target = next(group for group in match.groups() if group)
+                target = target.strip()
+                if not target or is_external_target(target):
+                    continue
+                if "<" in target or ">" in target:
+                    continue
+                target = target.split("#", 1)[0].split("?", 1)[0]
+                if not target:
+                    continue
+                target = urllib.parse.unquote(target)
+                resolved = (path.parent / target).resolve()
+                try:
+                    resolved.relative_to(ROOT)
+                except ValueError:
+                    continue
+                if not resolved.exists():
+                    errors.append(f"{rel(path)}:{lineno}: broken local link {target!r}")
+
+
+def check_own_repo_urls(errors: list[str]) -> None:
+    for path in sorted(ROOT.rglob("*")):
+        if path.suffix not in (".md", ".json") or is_hidden_or_git(path) or not path.is_file():
+            continue
+        if is_imported_root(path):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if OWN_ACCOUNT not in text:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for match in OWN_REPO_RE.finditer(line):
+                if match.group(1).casefold() not in KNOWN_OWN_REPOS:
+                    errors.append(
+                        f"{rel(path)}:{lineno}: {OWN_ACCOUNT}/{match.group(1)} is not a real "
+                        "repository; point at the awesome-journal-skills monorepo instead")
+
+
+# Hero artwork: the images at the top of the two READMEs, plus the logos and codes
+# beside them. Each entry is (path, width, height, minimum bytes).
+#
+# Why a byte floor and not just the dimensions: `assets/banner-en.png` was once
+# overwritten by a screenshot of a bot-check interstitial captured at exactly the
+# banner's size. Every dimension still agreed; only the file size gave it away, because
+# a mostly-white error page compresses to a tenth of what the real artwork does. The
+# floors below sit at roughly half of each asset's committed size, which is loose
+# enough for an honest re-export and tight enough to catch a substitution.
+HERO_ASSETS = [
+    ("assets/banner-zh.png", 2400, 860, 250_000),
+    ("assets/banner-en.png", 2400, 860, 250_000),
+    ("assets/copaper-logo.png", 1252, 512, 40_000),
+    ("assets/stanford-reap-logo.png", 812, 178, 15_000),
+    ("assets/copaper-qrcode.png", 444, 528, 3_000),
+]
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def png_size(data: bytes) -> tuple[int, int] | None:
+    """(width, height) from the IHDR chunk, or None if this is not a PNG."""
+    if not data.startswith(PNG_MAGIC) or len(data) < 24:
+        return None
+    return struct.unpack(">II", data[16:24])
+
+
+def check_hero_assets(errors: list[str]) -> None:
+    for name, width, height, min_bytes in HERO_ASSETS:
+        path = ROOT / name
+        if not path.exists():
+            errors.append(f"{name}: hero asset is missing")
+            continue
+        data = path.read_bytes()
+        size = png_size(data)
+        if size is None:
+            errors.append(f"{name}: not a PNG (the file was replaced by something else)")
+            continue
+        if size != (width, height):
+            errors.append(
+                f"{name}: is {size[0]}x{size[1]}, expected {width}x{height} — update "
+                "HERO_ASSETS in the same commit if the artwork was redesigned")
+        if len(data) < min_bytes:
+            errors.append(
+                f"{name}: {len(data):,} bytes is below the {min_bytes:,}-byte floor. "
+                "A blank or error-page capture compresses this small; the artwork does "
+                "not")
+
+
+# --- documented counts -------------------------------------------------------------
+# Numbers written into prose drift silently. `journal-match.md` and the journal-selection
+# README described a 743-venue index, 289 depth packs, a retrieval vocabulary "300 terms
+# deep" and "1,725 adjacency edges" long after those artefacts held 744, 290, 900 and
+# 1,511 — every one of them a generated file sitting in the same directory as the
+# sentence describing it. `check_readme_badges` reconciles the two root READMEs, which is
+# where a *reader* meets a count; nothing reconciled the capability docs, which is where
+# an *agent* meets one. An agent told the index is 300 terms deep will explain a tool
+# that has not existed since the depth was measured and raised.
+#
+# Each entry pins one prose number to the artefact it is about: every occurrence of the
+# pattern in that file must equal the value computed from the file it describes. Thousands
+# separators are tolerated on the way in, so both "1511" and "1,511" satisfy the check.
+
+VENUE_INDEX = ROOT / "shared-resources/journal-selection/venue-index.tsv"
+SCOPE_POSTINGS = ROOT / "shared-resources/journal-selection/scope-postings.tsv"
+TOPIC_POSTINGS = ROOT / "shared-resources/journal-selection/topic-postings.tsv"
+LADDER = ROOT / "shared-resources/journal-selection/ladder.tsv"
+GOLD_SET = ROOT / "shared-resources/journal-selection/eval/gold-set.tsv"
+
+NUM = r"([\d,]+)"
+DOCUMENTED_COUNTS: list[tuple[str, str, str]] = [
+    # (file, pattern capturing the number, live-value key)
+    ("shared-resources/journal-selection/journal-match.md",
+     rf"\*\*{NUM} venues\*\* are in", "venues"),
+    ("shared-resources/journal-selection/journal-match.md",
+     rf"venue-index\.tsv\) \({NUM} venues\)", "venues"),
+    ("shared-resources/journal-selection/journal-match.md",
+     rf"own depth pack \({NUM}\)", "depth_venues"),
+    ("shared-resources/journal-selection/journal-match.md",
+     rf"breadth bundle \({NUM}\)", "breadth_venues"),
+    ("shared-resources/journal-selection/journal-match.md",
+     rf"full {NUM}-term scope vocabulary", "postings_depth"),
+    ("shared-resources/journal-selection/journal-match.md",
+     rf"ladder\.tsv\) \({NUM} adjacency edges\)", "ladder_edges"),
+    ("shared-resources/journal-selection/README.md",
+     rf"index of \*\*{NUM} venues\*\*", "venues"),
+    ("shared-resources/journal-selection/README.md",
+     rf"vocabulary, {NUM} terms deep", "postings_depth"),
+    ("shared-resources/journal-selection/README.md",
+     rf"\*\*{NUM} adjacency edges\*\*", "ladder_edges"),
+    ("shared-resources/journal-selection/README.md",
+     rf"full {NUM}-term vocabulary", "postings_depth"),
+    ("shared-resources/journal-selection/README.md",
+     rf"A {NUM}-paper gold set", "gold_papers"),
+    ("tools/README.md", rf"stable index of all {NUM} venues", "venues"),
+    ("tools/README.md", rf"\({NUM} depth packs", "depth_venues"),
+    ("tools/README.md", rf"depth packs \+ {NUM} breadth-bundle profiles", "breadth_venues"),
+    ("tools/README.md", rf"the {NUM}-term-deep inverted index", "postings_depth"),
+    ("tools/README.md", rf"rank the {NUM} indexed venues", "venues"),
+    ("shared-resources/journal-selection/README.md",
+     rf"reaches {NUM} of the", "topic_venues"),
+]
+
+
+def _tsv_rows(path: Path) -> int:
+    """Data rows in a TSV — the header line does not count."""
+    with path.open(encoding="utf-8") as handle:
+        return max(sum(1 for line in handle if line.strip()) - 1, 0)
+
+
+def _postings_depth(path: Path) -> int | None:
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("#"):
+                break
+            key, _, value = line[1:].rstrip("\n").partition("\t")
+            if key == "depth" and value.isdigit():
+                return int(value)
+    return None
+
+
+def live_documented_counts(errors: list[str]) -> dict[str, int]:
+    """The generated artefacts' own numbers, read from the artefacts."""
+    values: dict[str, int] = {}
+    if VENUE_INDEX.exists():
+        depth = breadth = 0
+        with VENUE_INDEX.open(encoding="utf-8") as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            try:
+                column = header.index("coverage")
+            except ValueError:
+                column = None
+            rows = 0
+            for line in handle:
+                if not line.strip():
+                    continue
+                rows += 1
+                if column is not None:
+                    field = line.rstrip("\n").split("\t")[column]
+                    if field == "depth":
+                        depth += 1
+                    elif field == "breadth":
+                        breadth += 1
+        values["venues"] = rows
+        values["depth_venues"] = depth
+        values["breadth_venues"] = breadth
+    if LADDER.exists():
+        values["ladder_edges"] = _tsv_rows(LADDER)
+    if GOLD_SET.exists():
+        values["gold_papers"] = _tsv_rows(GOLD_SET)
+    if TOPIC_POSTINGS.exists():
+        # How many venues the subject vocabulary actually reached. Stated in prose next
+        # to a claim about what it is worth, so it is guarded like every other count —
+        # the harvest is re-run as packs are added and the number moves with it.
+        with TOPIC_POSTINGS.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("#"):
+                    break
+                key, _, value = line[1:].rstrip("\n").partition("\t")
+                if key == "covered" and value.isdigit():
+                    values["topic_venues"] = int(value)
+                    break
+    if SCOPE_POSTINGS.exists():
+        depth_header = _postings_depth(SCOPE_POSTINGS)
+        if depth_header is None:
+            errors.append(
+                "shared-resources/journal-selection/scope-postings.tsv has no #depth "
+                "header — regenerate with tools/gen_venue_index.py")
+        else:
+            values["postings_depth"] = depth_header
+    return values
+
+
+def check_documented_counts(errors: list[str]) -> None:
+    live = live_documented_counts(errors)
+    if live.get("venues") is not None and live["venues"] != EXPECTED_VENUE_COUNT:
+        errors.append(
+            f"venue-index.tsv holds {live['venues']} venues but EXPECTED_VENUE_COUNT is "
+            f"{EXPECTED_VENUE_COUNT} — regenerate the index or update the tripwire")
+    for name, pattern, key in DOCUMENTED_COUNTS:
+        path = ROOT / name
+        if not path.exists():
+            errors.append(f"{name}: documented-count target is missing")
+            continue
+        expected = live.get(key)
+        if expected is None:
+            continue                      # the artefact itself is absent; reported above
+        text = path.read_text(encoding="utf-8")
+        found = re.findall(pattern, text)
+        if not found:
+            errors.append(
+                f"{name}: no longer states its {key.replace('_', ' ')} in the expected "
+                f"wording (pattern {pattern!r}) — the sentence was rewritten, so either "
+                "restore a stated count or drop this entry from DOCUMENTED_COUNTS")
+            continue
+        for raw in found:
+            if int(raw.replace(",", "")) != expected:
+                errors.append(
+                    f"{name}: states {raw} for {key.replace('_', ' ')}, but the generated "
+                    f"artefact holds {expected:,}")
+
+
+def print_live_counts() -> int:
+    skill_count = len(iter_skill_files())
+    pack_roots = set(first_party_plugin_roots())
+    root_entries = sum(
+        1
+        for path in ROOT.glob("*/README.md")
+        if ROOT_ENTRY_MARKER in path.read_text(encoding="utf-8", errors="replace")
+    )
+    print("Live repository inventory (copy into the EXPECTED_* tripwires + README badges):")
+    print(f"  EXPECTED_SKILL_COUNT          = {skill_count}")
+    print(f"  EXPECTED_PACK_COUNT           = {len(pack_roots)}")
+    print(f"  EXPECTED_ROOT_JOURNAL_ENTRIES = {root_entries}")
+    return 0
+
+
+def main() -> int:
+    if "--counts" in sys.argv[1:]:
+        return print_live_counts()
+    errors: list[str] = []
+    check_counts(errors)
+    check_documented_counts(errors)
+    check_external_import_policy(errors)
+    check_root_journal_entries(errors)
+    check_readme_badges(errors)
+    check_readme_parity(errors)
+    check_root_marketplace(errors)
+    check_plugin_metadata(errors)
+    check_pack_documentation(errors)
+    check_source_maps(errors)
+    check_skill_frontmatter(errors)
+    check_showcase(errors)
+    check_hero_assets(errors)
+    check_markdown_links(errors)
+    check_own_repo_urls(errors)
+
+    if errors:
+        print("Repository audit failed:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+
+    print(
+        "Repository audit passed: "
+        f"{EXPECTED_SKILL_COUNT} canonical skills, "
+        f"{EXPECTED_PACK_COUNT} curated packs, "
+        f"{EXPECTED_ROOT_JOURNAL_ENTRIES} root journal entries, "
+        f"{EXPECTED_SHOWCASE_CASES} executed showcase cases."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
