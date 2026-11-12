@@ -1,9 +1,9 @@
-"""Export this Windows user's standalone skills into the Git-managed plugin."""
+"""Export standalone skills into the Git-managed plugin."""
+import argparse
 import hashlib
 import json
 import re
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 
@@ -39,12 +39,22 @@ def replace_once(path, old, new):
 
 
 def main():
-    if len(sys.argv) != 2 or not re.fullmatch(r"\d+\.\d+\.\d+", sys.argv[1]):
-        raise SystemExit("Usage: python sync-skills.py 1.0.1")
-    version = sys.argv[1]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("version")
+    parser.add_argument("--add-only", action="store_true",
+                        help="Keep all packaged skills and resources; add missing skills only")
+    args = parser.parse_args()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
+        parser.error("version must use MAJOR.MINOR.PATCH")
+    version = args.version
     skills = sorted((p for root in SOURCES if root.is_dir() for p in root.iterdir()
                      if not p.name.startswith(".") and (p / "SKILL.md").is_file()),
                     key=lambda p: p.name)
+    if args.add_only:
+        skills = [p for p in skills if not (PLUGIN / "skills" / p.name).exists()]
+        if not skills:
+            print("No new skills; existing package unchanged")
+            return
     if not skills or len({p.name for p in skills}) != len(skills):
         raise ValueError("No skills found, or duplicate source folder names")
     if any(p.name == "awesome-journal-skills" for p in skills) and not (LIBRARY / "catalog.json").is_file():
@@ -53,15 +63,33 @@ def main():
     # Stage and inspect the complete export before replacing the generated copy.
     with tempfile.TemporaryDirectory(prefix=".export-", dir=ROOT) as temp:
         staged = Path(temp) / "my-skills"
+        if args.add_only and PLUGIN.exists():
+            shutil.copytree(PLUGIN, staged)
         for source in skills:
             shutil.copytree(source, staged / "skills" / source.name, ignore=ignored)
+            entry = staged / "skills" / source.name / "SKILL.md"
+            if source.name == "mri-dataset-analysis":
+                replace_once(entry,
+                             "/home/siat/Task/Task_zxr/mri_foundation/pre_processing/data_pre/",
+                             "<当前项目根目录>/pre_processing/data_pre/")
+            if "# MRFoundry:" in entry.read_text(encoding="utf-8"):
+                for doc in entry.parent.rglob("*.md"):
+                    text = doc.read_text(encoding="utf-8")
+                    doc.write_text(text.replace(".agents/skills/", "../"), encoding="utf-8")
+                text = entry.read_text(encoding="utf-8")
+                end = text.index("\n", text.index("# MRFoundry:"))
+                note = ("\n\nResolve script paths relative to this SKILL.md's directory. "
+                        "Sibling skills are under `../<skill-name>/`. Replace relative paths "
+                        "in command examples with their resolved absolute paths before running "
+                        "from a project directory; do not assume a project-local skill install.")
+                entry.write_text(text[:end] + note + text[end:], encoding="utf-8")
         if any(p.name == "awesome-journal-skills" for p in skills):
             shutil.copytree(LIBRARY, staged / "resources/Awesome-Journal-Skills", ignore=ignored)
             replace_once(staged / "skills/awesome-journal-skills/SKILL.md",
                          "`C:/Users/Administrator/.codex/skill-libraries/Awesome-Journal-Skills`",
                          "`../../resources/Awesome-Journal-Skills` (resolve this path relative to this SKILL.md directory)")
         chart = staged / "skills/publication-chart-skill/SKILL.md"
-        if chart.exists():
+        if any(p.name == "publication-chart-skill" for p in skills):
             replace_once(chart, "## Installed Windows runtime", "## Runtime setup on the current computer")
             replace_once(chart,
                          "A dedicated environment is available at `C:/Users/Administrator/.codex/skills/publication-chart-skill/.venv/Scripts/python.exe`. Use it for generation and the bundled helper when no project-specific interpreter has been selected. Its `pubtab.exe` is in the same `Scripts` directory.",
@@ -77,6 +105,9 @@ def main():
                     "name": "my-skills", "version": version,
                     "description": "Joker-ZXR personal research skills",
                     "author": {"name": "Joker-ZXR"}}
+        if args.add_only and (staged / "plugin.json").exists():
+            manifest = json.loads((staged / "plugin.json").read_text(encoding="utf-8"))
+            manifest["version"] = version
         (staged / "plugin.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         files = sorted(p for p in staged.rglob("*") if p.is_file())
         digest = hashlib.sha256()
@@ -96,15 +127,18 @@ def main():
         if PLUGIN.exists():
             shutil.rmtree(PLUGIN)
         shutil.move(str(staged), str(PLUGIN))
-    report = {"version": version, "skills": len(skills), "files": len(files),
+    total = len(list((PLUGIN / "skills").glob("*/SKILL.md")))
+    report = {"version": version, "skills": total, "added_skills": len(skills), "files": len(files),
               "bundle_sha256": digest.hexdigest(),
               "sources": [{"name": p.name, "path": str(p)} for p in skills],
               "journal_library": str(LIBRARY)}
     (ROOT / "export-report.local.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     rows = ["# Included skills", "", "| Skill | Source directory |", "|---|---|"]
+    if args.add_only and (ROOT / "SKILLS.md").exists():
+        rows = (ROOT / "SKILLS.md").read_text(encoding="utf-8").rstrip().splitlines()
     rows += [f"| {p.name} | {'~/.agents/skills' if '.agents' in p.parts else '~/.codex/skills'} |" for p in skills]
     (ROOT / "SKILLS.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
-    print(f"Exported {len(skills)} skills, {len(files)} files, version {version}")
+    print(f"Exported {total} skills ({len(skills)} from local sources), {len(files)} files, version {version}")
     print(f"Plugin directory: {PLUGIN}")
 
 

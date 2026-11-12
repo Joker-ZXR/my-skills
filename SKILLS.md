@@ -39,3 +39,13 @@
 | tabbit | ~/.agents/skills |
 | vivid-figures-skill | ~/.codex/skills |
 | write-scientific-manuscript | ~/.codex/skills |
+| caveman | ~/.codex/skills |
+| deep-learning-recon | ~/.agents/skills |
+| diffusion-mri | ~/.agents/skills |
+| mri-dataset-analysis | ~/.codex/skills |
+| mri-hardware | ~/.agents/skills |
+| mri-reconstruction | ~/.agents/skills |
+| mri-research | ~/.agents/skills |
+| mri-research-workflow | ~/.agents/skills |
+| pulse-sequence-design | ~/.agents/skills |
+| standardize-mri-nifti | ~/.codex/skills |

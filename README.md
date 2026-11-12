@@ -20,13 +20,15 @@ codex plugin list --json
 维护电脑：修改原始skill目录，然后在本仓库运行：
 
 ```powershell
-python .\sync-skills.py 1.0.1
+python .\sync-skills.py 1.0.2 --add-only
 git add .
-git commit -m "Update skills to 1.0.1"
+git commit -m "Add local skills in 1.0.2"
 git push origin main
 ```
 
-下次使用新的递增版本号。同步脚本读取当前Windows用户的`~/.codex/skills`和`~/.agents/skills`，完整替换本仓库生成的插件副本。因此请在原始skill目录修改，直接修改生成副本会在下次导出时被覆盖。脚本会同步新增、修改和删除的skill。
+下次使用新的递增版本号。同步脚本读取当前用户的`~/.codex/skills`和`~/.agents/skills`。`--add-only` 仅加入仓库尚无的技能，保留全部已有技能和附带资源；同名技能跳过。本机没有新增技能时不改版本或文件。Linux/macOS 可使用 `python3 sync-skills.py 1.0.2 --add-only`。
+
+省略 `--add-only` 会按本机来源完整替换插件目录，包括删除本机没有的技能和资源；仅在明确需要完整重建且来源齐全时使用。
 
 使用电脑：
 
@@ -41,6 +43,8 @@ codex plugin list --json
 ## 打包范围与运行依赖
 
 收录两个用户目录中的独立skill，保留第三方LICENSE、NOTICE和来源说明。现有插件缓存、OpenAI系统skill、Python虚拟环境、node_modules、本机运行文件和BGGG历史项目输出不纳入仓库。没有为第三方内容统一指定新许可证。
+
+1.0.2 新增 10 个独立技能，主技能总数为 47；原有 37 个技能和期刊资源保持原样。新增内容及跨机器路径适配见 [新增技能说明](plugins/my-skills/LOCAL-ADDITIONS.md)。
 
 `awesome-journal-skills`依赖的完整期刊库位于插件的`resources/Awesome-Journal-Skills`。其入口在导出时改为相对路径，内部模块布局保持原样。
 
